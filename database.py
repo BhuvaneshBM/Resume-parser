@@ -1,5 +1,7 @@
 import os
+import logging
 from collections.abc import AsyncGenerator
+from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 from dotenv import load_dotenv
@@ -11,6 +13,7 @@ from models import metadata
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 pool: asyncpg.Pool | None = None
@@ -22,10 +25,58 @@ def get_database_url() -> str:
     return DATABASE_URL
 
 
+def mask_database_url(database_url: str) -> str:
+    parsed = urlsplit(database_url)
+    if parsed.password is None:
+        return database_url
+
+    netloc = ""
+    if parsed.username:
+        netloc = f"{parsed.username}:***@"
+
+    hostname = parsed.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    netloc += hostname
+
+    if parsed.port:
+        netloc += f":{parsed.port}"
+
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
 async def connect_db() -> None:
     global pool
     if pool is None:
-        pool = await asyncpg.create_pool(dsn=get_database_url())
+        database_url = get_database_url()
+        try:
+            pool = await asyncpg.create_pool(
+                dsn=database_url,
+                min_size=2,
+                max_size=10,
+            )
+        except Exception:
+            logger.critical(
+                "Database pool initialization failed database_url=%s",
+                mask_database_url(database_url),
+                exc_info=True,
+            )
+            raise SystemExit(1)
+
+
+async def check_database_connection() -> None:
+    database_url = get_database_url()
+    try:
+        db_pool = await get_pool()
+        async with db_pool.acquire() as connection:
+            await connection.fetchval("SELECT 1")
+    except Exception:
+        logger.critical(
+            "Database startup check failed database_url=%s",
+            mask_database_url(database_url),
+            exc_info=True,
+        )
+        raise SystemExit(1)
 
 
 async def close_db() -> None:

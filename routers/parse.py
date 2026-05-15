@@ -1,4 +1,5 @@
 import json
+import os
 import uuid
 from io import BytesIO
 
@@ -11,6 +12,8 @@ from workers.tasks import parse_resume_task
 
 
 router = APIRouter()
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "5"))
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
 
 def decode_jsonb(value):
@@ -25,8 +28,8 @@ def extract_pdf_text(contents: bytes) -> str:
         return "\n".join(page.extract_text() or "" for page in reader.pages).strip()
     except Exception as exc:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Could not extract text from PDF",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="could not extract text from PDF",
         ) from exc
 
 
@@ -43,11 +46,17 @@ async def parse_resume(
 
     if file.content_type != "application/pdf":
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only PDF uploads are supported",
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="only PDF files are accepted",
         )
 
     contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"file too large, maximum size is {MAX_FILE_SIZE_MB}MB",
+        )
+
     raw_text = extract_pdf_text(contents)
     if len(raw_text) < 50:
         raise HTTPException(

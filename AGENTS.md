@@ -7,6 +7,7 @@ Guidance for future Codex sessions working in this repository.
 This is a FastAPI resume parser backed by Postgres, Redis, Celery, and Gemini.
 
 Main flow:
+- `GET /health` returns `{"status": "ok", "version": "...", "timestamp": "..."}` and is used by `verify.sh`.
 - `POST /parse` accepts a PDF upload.
 - `routers/parse.py` extracts text with PyPDF2, stores a `resumes` row with status `pending`, and enqueues `parse_resume_task`.
 - `workers/tasks.py` reads the resume text, calls Gemini `gemini-2.5-flash`, validates the response with `ParsedResume`, inserts into `parsed_fields`, and updates status to `done` or `failed`.
@@ -15,6 +16,7 @@ Main flow:
 Core files:
 - `main.py` - FastAPI app and lifespan setup.
 - `database.py` - asyncpg pool and table creation from SQLAlchemy metadata.
+- `logging_config.py` - application logging setup for console and `logs/app.log`.
 - `models.py` - SQLAlchemy table metadata for `resumes` and `parsed_fields`.
 - `schemas.py` - Pydantic v2 `ParsedResume` schema.
 - `routers/parse.py` - API endpoints.
@@ -22,6 +24,8 @@ Core files:
 - `workers/celery_config.py` - Celery configuration module loaded via `config_from_object`.
 - `workers/monitor.py` - Redis/Celery queue status helper.
 - `docker-compose.yml` - API, worker, Redis, and Postgres services.
+- `verify.sh` - end-to-end golden path verifier.
+- `test_resume.pdf` - committed text-based fictional PDF fixture for `verify.sh`.
 
 ## Local Environment
 
@@ -31,11 +35,23 @@ Required environment variables:
 - `GEMINI_API_KEY`
 - `GEMINI_MODEL`, default should remain `gemini-2.5-flash`
 
+Additional app configuration:
+- `LOG_LEVEL`, default `INFO`
+- `MAX_FILE_SIZE_MB`, default `5`
+- `APP_VERSION`, default `1.0.0`
+- `OPENAI_API_KEY` exists in `.env.example` as a future-provider placeholder; current worker code still uses Gemini.
+
 Use `.env.example` as the template. Never commit `.env`.
 
 Important Docker hostname rule:
 - Inside Docker Compose, use `postgres` and `redis` hostnames.
 - From host Windows Python, those names may not resolve. Helper scripts include fallbacks for common cases, but app containers should continue using Docker service names.
+
+Windows Python notes:
+- Docker runs Python 3.12; host Windows may have a different default Python.
+- Python 3.12.10 has been installed locally at `C:\Users\bhuva\AppData\Local\Programs\Python\Python312\python.exe`.
+- Git Bash may not have a working `python3`; it can be missing or point to the Microsoft Store alias. Prefer `py -3.12`, `python`, or the full Python 3.12 path when running ad hoc host commands.
+- `verify.sh` intentionally discovers a working Python command and does not require `jq`.
 
 ## Docker Networking Rules
 
@@ -92,10 +108,16 @@ Check API logs:
 docker compose logs --tail=120 api
 ```
 
+Run the golden path verifier:
+
+```bash
+./verify.sh
+```
+
 Validate Python syntax:
 
 ```bash
-python -m compileall main.py database.py models.py schemas.py routers workers check_db.py test_llm.py test_schema.py
+python -m compileall main.py database.py models.py schemas.py routers workers check_db.py test_llm.py test_schema.py logging_config.py
 ```
 
 Inspect DB from inside Docker:
@@ -122,12 +144,24 @@ Test schema validation:
 python test_schema.py
 ```
 
+Pretty-print JSON from Git Bash on this Windows machine:
+
+```bash
+curl -s http://localhost:8000/health | "/c/Users/bhuva/AppData/Local/Programs/Python/Python312/python.exe" -m json.tool
+```
+
 ## API Usage
+
+Health check:
+
+```bash
+curl -s http://localhost:8000/health
+```
 
 Upload a PDF:
 
 ```bash
-curl -s -X POST http://localhost:8000/parse -F "file=@Resume.pdf"
+curl -s -X POST http://localhost:8000/parse -F "file=@test_resume.pdf"
 ```
 
 Poll results:
@@ -138,6 +172,28 @@ curl -s http://localhost:8000/results/<task_id>
 
 Expected non-final statuses include `pending`, `processing`, and `failed`.
 Final successful status is `done`.
+
+API error response standards:
+- Missing upload file on `POST /parse` returns HTTP 422 with `{"detail":"no file provided"}`.
+- Non-PDF uploads return HTTP 415 with `{"detail":"only PDF files are accepted"}`.
+- Files larger than `MAX_FILE_SIZE_MB` return HTTP 413 with `{"detail":"file too large, maximum size is 5MB"}` when the default 5 MB limit is active.
+- PyPDF2 extraction exceptions return HTTP 422 with `{"detail":"could not extract text from PDF"}`.
+- Readable PDFs with too little extracted text return HTTP 400 with `{"detail":"the PDF could not be read"}`.
+- Unknown task id on `GET /results/{task_id}` returns HTTP 404 with `{"detail":"task not found"}`.
+
+Manual upload with pretty JSON from PowerShell:
+
+```powershell
+curl.exe -s -X POST http://localhost:8000/parse -F "file=@test_resume.pdf" |
+  & "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" -m json.tool
+```
+
+Manual upload with pretty JSON from Git Bash:
+
+```bash
+curl -s -X POST http://localhost:8000/parse -F "file=@test_resume.pdf" \
+  | "/c/Users/bhuva/AppData/Local/Programs/Python/Python312/python.exe" -m json.tool
+```
 
 ## Worker and Retry Behavior
 
@@ -222,6 +278,27 @@ Keep this normalization unless the schema is changed to allow optional values.
 `parsed_fields.skills`, `experience`, and `education` are stored as Postgres `jsonb`.
 `routers/parse.py` uses `decode_jsonb()` because asyncpg can return JSONB values as strings depending on connection setup.
 
+## API Runtime Behavior
+
+`main.py` includes production-readiness middleware and handlers:
+- `CORSMiddleware` is enabled with all origins, methods, and headers allowed. Lock this down before a real public deployment.
+- `RequestLoggingMiddleware` logs method, path, status code, and response time in milliseconds. It uses `time.time()` before and after `await call_next(request)`.
+- A global `@app.exception_handler(Exception)` logs unhandled exceptions with traceback and returns clean JSON: `{"error":"internal server error","detail": str(exc)}` with HTTP 500.
+- Temporary crash-test routes such as `/crash` must not be committed.
+
+`logging_config.py`:
+- Configures Python logging with `LOG_LEVEL` defaulting to `INFO`.
+- Uses format `timestamp | level | module | message`.
+- Writes to console and `logs/app.log`.
+- `logs/app.log` is ignored by the existing `*.log` rule and should not be committed.
+
+`database.py`:
+- Uses asyncpg pool sizing `min_size=2`, `max_size=10`.
+- On startup, `main.py` calls `connect_db()`, `check_database_connection()`, then `init_db()`.
+- `check_database_connection()` runs `SELECT 1`.
+- Pool initialization and startup check failures log `CRITICAL` with the database URL included but password masked as `***`, then raise `SystemExit(1)` so Docker restarts the API container.
+- Never log an unmasked `DATABASE_URL`.
+
 ## Docker Compose Notes
 
 Redis healthcheck should stay in exec form:
@@ -246,6 +323,26 @@ depends_on:
 
 Both `api` and `worker` should use `restart: unless-stopped`.
 
+The API container does not run Uvicorn with reload. After editing `main.py` or routes, restart the API before testing new endpoints:
+
+```bash
+docker compose restart api
+```
+
+When `/health` returned 404 during debugging, the cause was an already-running API container that had not loaded the new `main.py`; restarting `api` fixed it.
+
+When testing DB startup failure:
+
+```bash
+docker compose stop postgres
+docker compose restart api
+docker compose logs api | Select-String -Pattern "CRITICAL"
+docker compose start postgres
+docker compose restart api
+```
+
+Expected CRITICAL message includes `Database pool initialization failed database_url=postgresql://postgres:***@postgres:5432/resumes` or `Database startup check failed ...`.
+
 After editing `docker-compose.yml`, always run:
 
 ```bash
@@ -255,6 +352,25 @@ docker compose config
 If `docker compose config` renders the Redis healthcheck as `CMD-SHELL`, it is probably wrong for this repo. It should render as separate `CMD`, `redis-cli`, and `ping` entries.
 
 ## Debugging Workflows
+
+Golden path verifier:
+
+```bash
+./verify.sh
+```
+
+Expected behavior:
+- Check `GET /health` returns HTTP 200.
+- Upload `test_resume.pdf`.
+- Extract `task_id` using Python JSON parsing, not `jq`.
+- Poll `/results/{task_id}` every 3 seconds for up to 60 seconds.
+- Print `OK` only when status is `done` and all required fields are present.
+
+`verify.sh` failure modes:
+- `FAIL: API health check returned HTTP ...` usually means the API is down, the port is not published, or the API container needs restart after a code change.
+- `FAIL: parse response was not valid JSON` can happen if the Python command used for JSON parsing is broken. On Windows/Git Bash, check for the Microsoft Store `python3` alias problem.
+- `FAIL: timeout waiting for result` requires checking worker logs, DB status, and Redis queue state.
+- If `verify.sh` appears to parse the wrong person, confirm `test_resume.pdf` has not been overwritten with another local PDF.
 
 Failed `/results/{task_id}` response:
 
@@ -277,6 +393,11 @@ docker compose exec -T api python check_db.py
 ```
 
 Common root causes:
+- The API container was not restarted after adding or changing a route.
+- `test_resume.pdf` was overwritten by another PDF.
+- The local PDF is image-based or otherwise yields empty text from PyPDF2.
+- The uploaded file exceeded `MAX_FILE_SIZE_MB`.
+- The uploaded file had the wrong `content_type`.
 - Gemini returned `null` for a required string before normalization.
 - Gemini returned invalid JSON or fenced JSON.
 - Gemini returned `503 UNAVAILABLE` or 429 due to demand/rate limits.
@@ -311,6 +432,18 @@ python test_llm.py
 
 Use `test_llm.py` only when a valid `GEMINI_API_KEY` is configured and a live API call is intended.
 
+Test PDF fixture:
+- `test_resume.pdf` is a committed exception to the usual no-PDF rule. It is fictional and safe to keep in the repo.
+- It must be text-based, not image-based, so `PyPDF2` can extract text.
+- Current expected content is Alex Johnson, `alex@example.com`, skills `Python`, `FastAPI`, `PostgreSQL`, Acme Corp Backend Engineer for 2 years, and BSc Computer Science from University of Mumbai 2022.
+- If recreated, verify extraction before using it:
+
+```bash
+python -c "from PyPDF2 import PdfReader; text='\n'.join(page.extract_text() or '' for page in PdfReader('test_resume.pdf').pages); print(text); assert 'Alex Johnson' in text and 'alex@example.com' in text"
+```
+
+ReportLab was used locally to recreate the fixture as a text PDF, but it is not an app runtime dependency.
+
 ## Git and Secrets
 
 `.gitignore` should exclude:
@@ -324,10 +457,15 @@ Do not commit:
 - API keys
 - `.env`
 - `venv/`
-- uploaded resumes or sample PDFs
+- uploaded resumes or sample PDFs, except the committed fictional `test_resume.pdf` fixture
 - generated `__pycache__/`
 
 The local `.env` has previously contained a Gemini key. If it appears in output or commits, rotate it immediately.
+
+`.gitattributes` marks `*.pdf` as binary so `test_resume.pdf` is not line-ending converted by Git.
+
+Recent pushed commit:
+- `02482d5 Add end-to-end verification script` added `/health`, `verify.sh`, `test_resume.pdf`, `.gitattributes`, and API error handling for missing files / unknown task ids.
 
 ## Coding Style
 

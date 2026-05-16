@@ -39,6 +39,12 @@ htmlcov/
 celerybeat-schedule
 celerybeat.pid
 
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/tsconfig.tsbuildinfo
+
 # Local databases and generated data
 *.sqlite
 *.sqlite3

@@ -4,7 +4,7 @@ Guidance for future Codex sessions working in this repository.
 
 ## Project Overview
 
-This is a FastAPI resume parser backed by Postgres, Redis, Celery, and Gemini.
+This is a FastAPI resume parser backed by Postgres, Redis, Celery, and Gemini, with a Next.js frontend in `frontend/`.
 
 Main flow:
 - `GET /health` returns `{"status": "ok", "version": "...", "timestamp": "..."}` and is used by `verify.sh`.
@@ -24,6 +24,7 @@ Core files:
 - `workers/celery_config.py` - Celery configuration module loaded via `config_from_object`.
 - `workers/monitor.py` - Redis/Celery queue status helper.
 - `docker-compose.yml` - API, worker, Redis, and Postgres services.
+- `frontend/` - Next.js 14 App Router frontend.
 - `verify.sh` - end-to-end golden path verifier.
 - `test_resume.pdf` - committed text-based fictional PDF fixture for `verify.sh`.
 
@@ -40,6 +41,7 @@ Additional app configuration:
 - `MAX_FILE_SIZE_MB`, default `5`
 - `APP_VERSION`, default `1.0.0`
 - `OPENAI_API_KEY` exists in `.env.example` as a future-provider placeholder; current worker code still uses Gemini.
+- Frontend uses `NEXT_PUBLIC_API_URL`, defaulting in code to `http://localhost:8000`.
 
 Use `.env.example` as the template. Never commit `.env`.
 
@@ -142,6 +144,21 @@ Test schema validation:
 
 ```bash
 python test_schema.py
+```
+
+Frontend build:
+
+```bash
+cd frontend
+npm install
+npm run build
+```
+
+Run frontend locally:
+
+```bash
+cd frontend
+npm run dev
 ```
 
 Pretty-print JSON from Git Bash on this Windows machine:
@@ -299,6 +316,38 @@ Keep this normalization unless the schema is changed to allow optional values.
 - Pool initialization and startup check failures log `CRITICAL` with the database URL included but password masked as `***`, then raise `SystemExit(1)` so Docker restarts the API container.
 - Never log an unmasked `DATABASE_URL`.
 
+## Frontend
+
+The frontend is a Next.js 14 App Router app under `frontend/`.
+
+Core frontend files:
+- `frontend/app/layout.tsx` - root layout, Tailwind globals, centered max-width `2xl` shell, `Resume Parser` header.
+- `frontend/app/page.tsx` - server component rendering `UploadForm` inside a card.
+- `frontend/app/results/[taskId]/page.tsx` - server component passing `taskId` to `ResultsDisplay`.
+- `frontend/components/UploadForm.tsx` - client component for PDF upload and redirect to `/results/{taskId}`.
+- `frontend/components/ResultsDisplay.tsx` - client component that polls `/results/{taskId}` every 3 seconds and stops when status is `done` or `failed`.
+- `frontend/lib/api.ts` - API helper using `NEXT_PUBLIC_API_URL || "http://localhost:8000"`.
+- `frontend/components/ui/` - shadcn-style `badge`, `button`, `card`, and local `spinner` components.
+
+Frontend package notes:
+- Current Next version is `14.2.35`.
+- `npm run build` has passed.
+- `package-lock.json` should be committed with `package.json`.
+- `frontend/node_modules/`, `frontend/.next/`, and `frontend/out/` are ignored and must not be committed.
+
+Tailwind/shadcn notes:
+- shadcn added `@import "tw-animate-css";` and `@import "shadcn/tailwind.css";` in `frontend/app/globals.css`.
+- `frontend/tailwind.config.js` must define shadcn CSS-variable color tokens such as `border`, `ring`, `background`, `foreground`, `card`, `primary`, `muted`, etc.
+- The previous build error `The border-border class does not exist` was fixed by adding those theme tokens.
+- The previous build error for `outline-ring/50` was fixed by removing the incompatible global `@apply outline-ring/50` from `globals.css`.
+- `layout.tsx` should not import `Geist` from `next/font/google`; this setup uses the system font stack.
+- If TypeScript complains about `.next/types/**/*.ts` after deleting `.next/`, run `npm run build` or `npm run dev` once to regenerate Next type files.
+
+Frontend API/CORS notes:
+- The backend already has `CORSMiddleware` allowing all origins, methods, and headers. If the browser still reports CORS, restart the API container so it loads current `main.py`.
+- `next.config.js` exposes `NEXT_PUBLIC_API_URL` through `env`.
+- Docker Compose sets frontend `NEXT_PUBLIC_API_URL=http://localhost:8000`, which is correct for browser-side calls from the user’s machine.
+
 ## Docker Compose Notes
 
 Redis healthcheck should stay in exec form:
@@ -322,6 +371,31 @@ depends_on:
 ```
 
 Both `api` and `worker` should use `restart: unless-stopped`.
+
+The `frontend` service:
+
+```yaml
+frontend:
+  build:
+    context: ./frontend
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  environment:
+    NEXT_PUBLIC_API_URL: http://localhost:8000
+  ports:
+    - "3000:3000"
+  depends_on:
+    - api
+```
+
+`frontend/Dockerfile` uses `node:20-alpine`, runs `npm install`, `npm run build`, exposes `3000`, and starts with `npm start`.
+`frontend/.dockerignore` excludes `node_modules`, `.next`, `out`, npm logs, and env files.
+
+`docker compose build frontend` has passed. `docker compose up -d frontend` can fail if host port `3000` is already occupied by a local Node process. Check with:
+
+```powershell
+netstat -ano | Select-String ":3000"
+```
 
 The API container does not run Uvicorn with reload. After editing `main.py` or routes, restart the API before testing new endpoints:
 
